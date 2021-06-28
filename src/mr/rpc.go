@@ -23,7 +23,29 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type StatusUpdateArgs struct {
+	Id string
+	Status string
+	ResultFilePath []string
+}
 
+type TaskReply struct {
+	Id string
+	// 任务类型：map\reduce\nil
+	Type string
+	FilePath string
+	NReduce int
+	ReduceNum int
+	IntermediateFiles map[string]bool
+}
+
+type AliveArgs struct {
+	Id string
+}
+
+type AliveReply struct {
+	Status string
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

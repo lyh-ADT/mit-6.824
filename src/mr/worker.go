@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"bufio"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strings"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,7 +31,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,10 +38,191 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	// 注册
+	var taskReply, success = StatusUpdate(StatusUpdateArgs{"", "register", nil})
+	var Id = taskReply.Id
+	for {
+		log.Printf("当前任务：%+v\n", taskReply)
+		// do task
+		if taskReply.Type == "map" {
+			resultPaths, e := DoMap(mapf, taskReply, Id)
+			if e != nil {
+				return
+			}
+			taskReply,success = StatusUpdate(StatusUpdateArgs{Id, "finish", resultPaths})
+			if !success {
+				log.Panic("rpc失败，认为是coordinator已退出，worker退出")
+			}
+		} else if taskReply.Type == "reduce" {
+			resultPath,e := DoReduce(reducef, taskReply, Id)
+			if e != nil {
+				return
+			}
+			taskReply,success = StatusUpdate(StatusUpdateArgs{Id, "finish", []string{resultPath}})
+			if !success {
+				log.Panic("rpc失败，认为是coordinator已退出，worker退出")
+			}
+		} else {
+			time.Sleep(time.Duration(3 * time.Second))
+			taskReply, success = StatusUpdate(StatusUpdateArgs{Id, "idle", nil})
+			if !success {
+				log.Println("rpc失败，认为是coordinator已退出，worker退出")
+				return
+			}
+		}
+
+		// if Alive(AliveArgs{Id}).Status != "up" {
+		// 	log.Fatalf("%s:alive未得到响应，退出...", Id)
+		// 	break
+		// }
+	}
 
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+}
+
+func DoReduce(reducef func(string, []string) string,
+	taskReply TaskReply,
+	id string) (string,error) {
+
+	valueMap := map[string][]string{}
+	for filePath := range taskReply.IntermediateFiles {
+		
+		if filePath[strings.LastIndex(filePath, "-")+1:strings.LastIndex(filePath, ".")] != fmt.Sprint(taskReply.ReduceNum) {
+			continue
+		}
+		
+		kvs := ReadIntermdidate(filePath)
+		for _, kv := range kvs {
+			valueMap[kv.Key] = append(valueMap[kv.Key], kv.Value)
+		}
+	}
+	resultPath := fmt.Sprintf("mr-out-%d", taskReply.ReduceNum)
+	outputFile, outputError := os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE, 0666)
+	if outputError != nil {
+		fmt.Printf("An error occurred with file opening or creation\n")
+		return "", outputError
+	}
+	defer outputFile.Close()
+	outputWriter := bufio.NewWriter(outputFile)
+
+	for key, values := range valueMap {
+		v := reducef(key, values)
+		outputWriter.WriteString(fmt.Sprintf("%s %s\n", key, v))
+	}
+	outputWriter.Flush()
+
+	return resultPath, nil
+}
+
+func DoMap(mapf func(string, string) []KeyValue,
+	taskReply TaskReply,
+	id string) ([]string, error) {
+	// 按行读取文件
+	inputFile, inputError := os.Open(taskReply.FilePath)
+	if inputError != nil {
+		log.Fatalf("打开文件时出错: %s", inputError.Error())
+		return nil, inputError
+	}
+	defer inputFile.Close()
+	intermediate := []KeyValue{}
+	inputReader := bufio.NewReader(inputFile)
+	for {
+		inputString, readerError := inputReader.ReadString('\n')
+		if readerError == io.EOF {
+			intermediate = append(intermediate, mapf(taskReply.FilePath, inputString)...)
+			break
+		}
+		intermediate = append(intermediate, mapf(taskReply.FilePath, inputString)...)
+	}
+	return saveIntermediate(intermediate, id, taskReply.NReduce)
+}
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+func saveIntermediate(intermediate []KeyValue, workerId string, NReduce int) ([]string,error) {
+	if len(intermediate) == 0 {
+		return nil, nil
+	}
+	sort.Sort(ByKey(intermediate))
+	key := intermediate[0].Key
+	values := []string{}
+	resultFileMap := map[string]bool{}
+	for _, v := range intermediate {
+		if key != v.Key {
+			resultFile, e := writeIntermeidate(workerId, NReduce, key, values)
+			if e != nil {
+				return nil, e
+			}
+			resultFileMap[resultFile] = true
+			values = []string{}
+			key = v.Key
+		}
+		values = append(values, v.Value)
+	}
+	resultFile, e := writeIntermeidate(workerId, NReduce, key, values)
+	if e != nil {
+		return nil, e
+	}
+	resultFileMap[resultFile] = true
+	resultFiles := []string{}
+	for k := range resultFileMap {
+		resultFiles = append(resultFiles, k)
+	}
+	return resultFiles, nil
+}
+
+func writeIntermeidate(workerId string, NReduce int, key string, values []string) (string,error) {
+	filePath := fmt.Sprintf("intermediate-%s-%d.tmp", workerId, ihash(key) % NReduce)
+	outputFile, outputError := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+	if outputError != nil {
+		fmt.Printf("An error occurred with file opening or creation\n")
+		return "", outputError
+	}
+	defer outputFile.Close()
+	outputWriter := bufio.NewWriter(outputFile)
+	for _, v := range values {
+		outputWriter.WriteString(fmt.Sprintf("%s:%s\n", key, v))
+	}
+	outputWriter.Flush()
+	return filePath, nil
+}
+
+func ReadIntermdidate(filePath string) []KeyValue {
+	inputFile, inputError := os.Open(filePath)
+	if inputError != nil {
+		log.Fatalf("打开文件时出错: %s", inputError.Error())
+		return nil
+	}
+	defer inputFile.Close()
+	kvs := []KeyValue{}
+	inputReader := bufio.NewReader(inputFile)
+	for {
+		inputString, readerError := inputReader.ReadString('\n')
+		if readerError == io.EOF {
+			break
+		}
+		split := strings.SplitN(inputString, ":", 2)
+		kvs = append(kvs, KeyValue{split[0], split[1]})
+	}
+	return kvs
+}
+
+func StatusUpdate(status StatusUpdateArgs) (TaskReply, bool) {
+	reply := TaskReply{}
+	success := call("Coordinator.WorkerStatusUpdate", &status, &reply)
+	return reply, success
+}
+
+func Alive(args AliveArgs) AliveReply {
+	reply := AliveReply{}
+	call("Coordinator.WorkerAlive", &args, &reply)
+	return reply
 }
 
 //
@@ -71,7 +258,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		log.Print("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
