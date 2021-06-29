@@ -41,6 +41,11 @@ func Worker(mapf func(string, string) []KeyValue,
 	// 注册
 	var taskReply, success = StatusUpdate(StatusUpdateArgs{"", "register", nil})
 	var Id = taskReply.Id
+	logFile, err := os.OpenFile(fmt.Sprintf("worker-%s.log", Id), os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatal("创建日志文件失败")
+	}
+	log.SetOutput(logFile)
 	for {
 		log.Printf("当前任务：%+v\n", taskReply)
 		// do task
@@ -86,18 +91,21 @@ func DoReduce(reducef func(string, []string) string,
 	taskReply TaskReply,
 	id string) (string,error) {
 
+	log.Println("开始DoReduce")
 	valueMap := map[string][]string{}
 	for filePath := range taskReply.IntermediateFiles {
 		
 		if filePath[strings.LastIndex(filePath, "-")+1:strings.LastIndex(filePath, ".")] != fmt.Sprint(taskReply.ReduceNum) {
 			continue
 		}
-		
+		log.Printf("开始处理%s\n", filePath)
 		kvs := ReadIntermdidate(filePath)
+		log.Printf("读取到了%d个KeyValue\n", len(kvs))
 		for _, kv := range kvs {
 			valueMap[kv.Key] = append(valueMap[kv.Key], kv.Value)
 		}
 	}
+	log.Printf("Intermediate文件读取完毕, 共得到%d个Key, 开始reduce\n", len(valueMap))
 	resultPath := fmt.Sprintf("mr-out-%d", taskReply.ReduceNum)
 	outputFile, outputError := os.OpenFile(resultPath, os.O_WRONLY|os.O_CREATE, 0666)
 	if outputError != nil {
@@ -109,7 +117,10 @@ func DoReduce(reducef func(string, []string) string,
 
 	for key, values := range valueMap {
 		v := reducef(key, values)
-		outputWriter.WriteString(fmt.Sprintf("%s %s\n", key, v))
+		_, err :=outputWriter.WriteString(fmt.Sprintf("%s %s\n", key, v))
+		if err != nil {
+			log.Fatalf("写入文件结果文件异常: %+v", err)
+		}
 	}
 	outputWriter.Flush()
 
@@ -119,6 +130,7 @@ func DoReduce(reducef func(string, []string) string,
 func DoMap(mapf func(string, string) []KeyValue,
 	taskReply TaskReply,
 	id string) ([]string, error) {
+	log.Printf("执行DoMap，FilePath:%s\n", taskReply.FilePath)
 	// 按行读取文件
 	inputFile, inputError := os.Open(taskReply.FilePath)
 	if inputError != nil {
@@ -128,6 +140,7 @@ func DoMap(mapf func(string, string) []KeyValue,
 	defer inputFile.Close()
 	intermediate := []KeyValue{}
 	inputReader := bufio.NewReader(inputFile)
+	lineCount := 0
 	for {
 		inputString, readerError := inputReader.ReadString('\n')
 		if readerError == io.EOF {
@@ -135,7 +148,9 @@ func DoMap(mapf func(string, string) []KeyValue,
 			break
 		}
 		intermediate = append(intermediate, mapf(taskReply.FilePath, inputString)...)
+		lineCount += 1
 	}
+	log.Printf("DoMap完成, 遍历目标文件%d行，得到Key %d个", lineCount, len(intermediate))
 	return saveIntermediate(intermediate, id, taskReply.NReduce)
 }
 
@@ -194,6 +209,7 @@ func writeIntermeidate(workerId string, NReduce int, key string, values []string
 }
 
 func ReadIntermdidate(filePath string) []KeyValue {
+	log.Printf("开始读取Intermediate文件:%s\n", filePath)
 	inputFile, inputError := os.Open(filePath)
 	if inputError != nil {
 		log.Fatalf("打开文件时出错: %s", inputError.Error())
@@ -202,6 +218,7 @@ func ReadIntermdidate(filePath string) []KeyValue {
 	defer inputFile.Close()
 	kvs := []KeyValue{}
 	inputReader := bufio.NewReader(inputFile)
+	lineCount := 0
 	for {
 		inputString, readerError := inputReader.ReadString('\n')
 		if readerError == io.EOF {
@@ -209,7 +226,9 @@ func ReadIntermdidate(filePath string) []KeyValue {
 		}
 		split := strings.SplitN(inputString, ":", 2)
 		kvs = append(kvs, KeyValue{split[0], split[1]})
+		lineCount += 1
 	}
+	log.Printf("读取完Intermediate文件，共%d行", lineCount)
 	return kvs
 }
 
