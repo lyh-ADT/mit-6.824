@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
@@ -95,7 +96,7 @@ func DoReduce(reducef func(string, []string) string,
 	valueMap := map[string][]string{}
 	for filePath := range taskReply.IntermediateFiles {
 		
-		if filePath[strings.LastIndex(filePath, "-")+1:strings.LastIndex(filePath, ".")] != fmt.Sprint(taskReply.ReduceNum) {
+		if filePath[strings.LastIndex(filePath, "-")+1:strings.Index(filePath, ".")] != fmt.Sprint(taskReply.ReduceNum) {
 			continue
 		}
 		log.Printf("开始处理%s\n", filePath)
@@ -138,19 +139,12 @@ func DoMap(mapf func(string, string) []KeyValue,
 		return nil, inputError
 	}
 	defer inputFile.Close()
-	intermediate := []KeyValue{}
-	inputReader := bufio.NewReader(inputFile)
-	lineCount := 0
-	for {
-		inputString, readerError := inputReader.ReadString('\n')
-		if readerError == io.EOF {
-			intermediate = append(intermediate, mapf(taskReply.FilePath, inputString)...)
-			break
-		}
-		intermediate = append(intermediate, mapf(taskReply.FilePath, inputString)...)
-		lineCount += 1
+	content, err := ioutil.ReadAll(inputFile)
+	if err != nil {
+		log.Fatalf("DoMap 读取文件失败 %v: %+v", taskReply.FilePath, err)
 	}
-	log.Printf("DoMap完成, 遍历目标文件%d行，得到Key %d个", lineCount, len(intermediate))
+	intermediate := mapf(taskReply.FilePath, string(content))
+	log.Printf("DoMap完成，得到Key %d个", len(intermediate))
 	return saveIntermediate(intermediate, id, taskReply.NReduce)
 }
 
@@ -193,7 +187,7 @@ func saveIntermediate(intermediate []KeyValue, workerId string, NReduce int) ([]
 }
 
 func writeIntermeidate(workerId string, NReduce int, key string, values []string) (string,error) {
-	filePath := fmt.Sprintf("intermediate-%s-%d.tmp", workerId, ihash(key) % NReduce)
+	filePath := fmt.Sprintf("mr-%s-%d.intermediate.tmp", workerId, ihash(key) % NReduce)
 	outputFile, outputError := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
 	if outputError != nil {
 		fmt.Printf("An error occurred with file opening or creation\n")
@@ -224,7 +218,8 @@ func ReadIntermdidate(filePath string) []KeyValue {
 		if readerError == io.EOF {
 			break
 		}
-		split := strings.SplitN(inputString, ":", 2)
+		// 去掉最后的换行符
+		split := strings.SplitN(inputString[:len(inputString)-1], ":", 2)
 		kvs = append(kvs, KeyValue{split[0], split[1]})
 		lineCount += 1
 	}
