@@ -29,7 +29,7 @@ type WorkerInfo struct {
 type Coordinator struct {
 	Workers           map[string]*WorkerInfo
 	WorkerCount       int
-	Tasks             list.List
+	MapTasks          list.List
 	ReduceTasks       list.List
 	IntermediateFiles map[string]bool
 	ResultFiles       []string
@@ -59,6 +59,8 @@ func (c *Coordinator) WorkerStatusUpdate(args *StatusUpdateArgs, reply *TaskRepl
 			worker = c.Workers[reply.Id]
 		}
 	}
+	worker.LastAliveTime = time.Now().Unix()
+	reply.NReduce = c.nReduce
 	if args.Status == "finish" {
 		if args.ResultFilePath != nil {
 			if worker.Task.TaskType == "map" {
@@ -73,34 +75,37 @@ func (c *Coordinator) WorkerStatusUpdate(args *StatusUpdateArgs, reply *TaskRepl
 		worker.Status = "idle"
 		reply.Id = worker.Id
 		reply.Type = "nil"
-		log.Printf("任务{%+v}完成, 剩余任务数量：Map:%d Reduce:%d\n", worker.Task, c.Tasks.Len(), c.ReduceTasks.Len())
+		log.Printf("任务{%+v}完成, 剩余任务数量：Map:%d Reduce:%d\n", worker.Task, c.MapTasks.Len(), c.ReduceTasks.Len())
 	}
 
-	if c.Tasks.Len() == 0 {
+	if c.MapTasks.Len() == 0 {
 		if c.ReduceTasks.Len() == 0 {
 			// 所有任务完成
 			return nil
 		}
+
+		// 要等到所有的Worker把Map任务完成之后再进行
+		if !c.allMapTaskDone() {
+			return nil
+		}
+
 		// 进行Reduce
 		worker.Status = "running"
 		worker.Task = c.ReduceTasks.Front().Value.(Task)
 		c.ReduceTasks.Remove(c.ReduceTasks.Front())
-		worker.LastAliveTime = time.Now().Unix()
 
 		reply.Type = worker.Task.TaskType
 		reply.IntermediateFiles = c.IntermediateFiles
 		reply.ReduceNum = worker.Task.ReduceId
-		reply.NReduce = c.nReduce
+		
 	} else {
 		// 从队列中拿出任务进行返回
 		worker.Status = "running"
-		worker.Task = c.Tasks.Front().Value.(Task)
-		c.Tasks.Remove(c.Tasks.Front())
-		worker.LastAliveTime = time.Now().Unix()
+		worker.Task = c.MapTasks.Front().Value.(Task)
+		c.MapTasks.Remove(c.MapTasks.Front())
 
 		reply.Type = worker.Task.TaskType
 		reply.FilePath = worker.Task.FilePath
-		reply.NReduce = c.nReduce
 	}
 	return nil
 }
@@ -112,14 +117,32 @@ func (c *Coordinator) WorkerAlive(args *AliveArgs, reply *AliveReply) error {
 	return nil
 }
 
-func (c *Coordinator) KickDeadWorker() {
+func (c *Coordinator) kickDeadWorker() {
 	for k, v := range c.Workers {
 		if time.Now().Unix()-v.LastAliveTime > 10000 {
 			log.Printf("扫描到超时Worker: %s, 将其注销", v.Id)
 			delete(c.Workers, k)
-			c.Tasks.PushBack(v.Task)
+			c.MapTasks.PushBack(v.Task)
 		}
 	}
+}
+
+func (c *Coordinator) allMapTaskDone() bool {
+	for _, worker := range c.Workers {
+		if worker.Task.TaskType == "map" && worker.Status == "running" {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) allWorkerIdle() bool {
+	for _, worker := range c.Workers {
+		if worker.Status != "idle" {
+			return false
+		}
+	}
+	return true
 }
 
 //
@@ -158,16 +181,12 @@ func (c *Coordinator) Done() bool {
 	// Your code here.
 	c.workerListMutex.Lock()
 	defer c.workerListMutex.Unlock()
-	if c.Tasks.Len() != 0 {
+	if c.MapTasks.Len() != 0  || c.ReduceTasks.Len() != 0 {
 		return false
 	}
-	for _, worker := range c.Workers {
-		if worker.Status != "idle" {
-			ret = false
-		}
-	}
+	ret = c.allWorkerIdle()
 
-	c.KickDeadWorker()
+	c.kickDeadWorker()
 
 	if ret {
 		log.Printf("任务完成，结果文件：%+v\n", c.ResultFiles)
@@ -191,7 +210,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// 添加所有的Map任务
 	for _, f := range files {
-		c.Tasks.PushBack(Task{"map", f, -1})
+		c.MapTasks.PushBack(Task{"map", f, -1})
 	}
 
 	// 添加所有Reduce任务
