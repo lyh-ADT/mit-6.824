@@ -119,10 +119,14 @@ func (c *Coordinator) WorkerAlive(args *AliveArgs, reply *AliveReply) error {
 
 func (c *Coordinator) kickDeadWorker() {
 	for k, v := range c.Workers {
-		if time.Now().Unix()-v.LastAliveTime > 10000 {
+		if time.Now().Unix()-v.LastAliveTime > 10 {
 			log.Printf("扫描到超时Worker: %s, 将其注销", v.Id)
 			delete(c.Workers, k)
-			c.MapTasks.PushBack(v.Task)
+			if v.Task.TaskType == "map" {
+				c.MapTasks.PushBack(v.Task)
+			} else {
+				c.ReduceTasks.PushBack(v.Task)
+			}
 		}
 	}
 }
@@ -181,12 +185,13 @@ func (c *Coordinator) Done() bool {
 	// Your code here.
 	c.workerListMutex.Lock()
 	defer c.workerListMutex.Unlock()
+
+	c.kickDeadWorker()
+
 	if c.MapTasks.Len() != 0  || c.ReduceTasks.Len() != 0 {
 		return false
 	}
 	ret = c.allWorkerIdle()
-
-	c.kickDeadWorker()
 
 	if ret {
 		log.Printf("任务完成，结果文件：%+v\n", c.ResultFiles)
