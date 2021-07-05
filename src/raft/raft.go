@@ -18,14 +18,18 @@ package raft
 //
 
 import (
-//	"bytes"
+	//	"bytes"
+	"fmt"
+	"log"
+	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +54,12 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	FOLLOWER = 0
+	CANDIDATE = 1
+	LEADER = 2
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -61,6 +71,19 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	state int32
+	currentTerm int
+	votedFor int
+	log []string
+
+	commitIndex int
+	lastApplied int
+	leaderId int
+	
+	electionTimeout int32 // seconds
+	heartbeatTime time.Time
+
+	logger *log.Logger
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -69,11 +92,10 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, atomic.LoadInt32(&rf.state) == LEADER
 }
 
 //
@@ -143,6 +165,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -151,6 +177,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
 }
 
 //
@@ -158,6 +186,94 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = true
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+	}
+	if rf.votedFor != -1 {
+		// 已经投票给别人了
+		reply.VoteGranted = false
+	}
+	if reply.VoteGranted {
+		rf.votedFor = args.CandidateId
+		rf.changeState(FOLLOWER)
+		rf.logger.Printf("Id(%d)想让我给他投票，我给了", args.CandidateId)
+	} else {
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给，我给了Id(%d)", args.CandidateId, rf.votedFor)
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []string
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+// RPCHandler
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	rf.logger.Printf("领导Id(%d)发来命令, Term: %v", args.LeaderId, args.Term)
+	rf.heartbeatTime = time.Now()
+	reply.Success = true
+	
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		rf.logger.Printf("拒绝这个领导的命令(Term:%d)，跟不上我的脚步(currentTerm:%d)", args.Term, rf.currentTerm)
+		return
+	}
+	rf.currentTerm = args.Term
+	rf.changeState(FOLLOWER)
+	rf.leaderId = args.LeaderId
+	rf.votedFor = -1
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	return rf.callRpc("Raft.AppendEntries", server, args, reply)
+}
+
+func (rf *Raft) callRpc(method string, server int, args interface{}, reply interface{}) bool {
+	var wg = sync.WaitGroup{}
+	wg.Add(1)
+	var isOk int32 = 0
+	go func(){
+		var isTimeout int32 = 0
+		var isFinish int32 = 0
+		go func(){
+			time.Sleep(time.Microsecond * time.Duration(500))
+			if atomic.LoadInt32(&isFinish) == 1 {
+				return
+			}
+			atomic.StoreInt32(&isTimeout, 1)
+			wg.Done()
+		}()
+		ok := rf.peers[server].Call(method, args, reply)
+		if atomic.LoadInt32(&isTimeout) == 1 {
+			return
+		}
+		if ok {
+			atomic.StoreInt32(&isOk, 1)
+		}
+		atomic.StoreInt32(&isFinish, 1)
+		wg.Done()
+	}()
+	wg.Wait()
+	return atomic.LoadInt32(&isOk) == 1
 }
 
 //
@@ -190,8 +306,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+	return rf.callRpc("Raft.RequestVote", server, args, reply)
 }
 
 
@@ -234,6 +349,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.logger.Print("我被杀了")
 }
 
 func (rf *Raft) killed() bool {
@@ -244,13 +360,154 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
-
+	for !rf.killed() {
+		
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		time.Sleep(time.Duration(500) * time.Millisecond)
+		if rf.killed() {
+			log.Print("我死了")
+			return
+		}
 
+		rf.logger.Println("tick!")
+		rf.mu.Lock()
+		if rf.votedFor != -1 {
+			rf.logger.Print("正在进行选举，选举超时了")
+			
+			rf.votedFor = -1
+			rf.changeState(FOLLOWER)
+		}
+
+		if rf.state == LEADER {
+			// 我是领导者，发送心跳
+			if rf.sendHeartBeat() {
+				rf.logger.Print("所有心跳发送失败，我断网了")
+				rf.changeState(FOLLOWER)
+			}
+			rf.mu.Unlock()
+		} else {
+			// 不是领导者，就看看领导者是不是还活着
+			if time.Since(rf.heartbeatTime) > time.Duration(time.Millisecond * time.Duration(rf.electionTimeout)){
+				rf.logger.Print("心跳时间超时，我直接竞选！")
+				rf.mu.Unlock()
+				rf.startElection()
+			} else {
+				rf.mu.Unlock()
+			}
+		}
+		
 	}
+}
+
+// 返回是否全部失败
+func (rf *Raft) sendHeartBeat() bool {
+	// rf.logger.Print("发送心跳")
+	var hasOneSuccess int32 = 0
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers) - 1)
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int)  {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me, 0, 0, nil, 0}, reply)
+			if !ok {
+				rf.logger.Printf("发送心跳失败！Id(%d)", i)
+			} else {
+				if !reply.Success {
+					rf.logger.Printf("Id(%d)竟然拒绝了我的心跳", i)
+				} else {
+					atomic.StoreInt32(&hasOneSuccess, 1)
+				}
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	return atomic.LoadInt32(&hasOneSuccess) == 0
+}
+
+func (rf *Raft) startElection() {
+
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	rf.changeState(CANDIDATE)
+	rf.mu.Unlock()
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers)-1)
+	var votes int64 = 1 // 直接投一票给自己
+	rf.votedFor = rf.me
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int){
+			reply := RequestVoteReply{}
+			isOk := rf.sendRequestVote(i, 
+				&RequestVoteArgs{
+					rf.currentTerm,
+					rf.me,
+					0,
+					0,
+				}, &reply)
+			if !isOk {
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.logger.Printf("我落伍了，更新Term:%d", reply.Term)
+				} else {
+					rf.logger.Printf("请求投票失败，Id(%d)", i)
+				}
+			} else if reply.VoteGranted {
+				rf.logger.Printf("拉票成功！Id(%d)", i)
+				atomic.AddInt64(&votes, 1)
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votedFor = -1
+
+	if rf.state == FOLLOWER {
+		rf.logger.Printf("有人先当选了 : ) Id:%d", rf.leaderId)
+		return
+	}
+	if votes == 1 {
+		rf.logger.Print("只有我自己投票给了自己，我断网了")
+	}
+	rf.logger.Printf("竞选得到了%d张票，投票率%f", votes, float64(votes) / float64(len(rf.peers)))
+	if votes * 2 > int64(len(rf.peers)) {
+		rf.logger.Println("我当选了")
+		rf.changeState(LEADER)
+		rf.sendHeartBeat()
+	}
+	rf.randomizeElectionTimeout()
+}
+
+func (rf *Raft) changeState(s int32) {
+	atomic.StoreInt32(&rf.state, s)
+	str := "f"
+	if s == CANDIDATE {
+		str = "c"
+	} else if s == LEADER {
+		str = "l"
+	}
+	rf.logger.SetPrefix(fmt.Sprintf("%d(%s):\t", rf.me, str))
+	rf.logger.Print("我不一样了")
+}
+
+func (rf *Raft) sleep() {
+	time.Sleep(time.Millisecond * time.Duration(atomic.LoadInt32(&rf.electionTimeout)))
+}
+
+func (rf *Raft) randomizeElectionTimeout() {
+	atomic.StoreInt32(&rf.electionTimeout, int32(1500 + rand.Int() % 500))
 }
 
 //
@@ -272,6 +529,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.logger = log.New(os.Stdout, fmt.Sprintf("%d: ", me), log.Lshortfile|log.Ldate|log.Ltime)
+	rf.changeState(FOLLOWER)
+	rf.votedFor = -1
+	rf.randomizeElectionTimeout()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
