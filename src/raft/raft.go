@@ -192,20 +192,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	rf.heartbeatTime = time.Now()
+	
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, CurrentTerm:%d, CandidateTerm:%d", args.CandidateId, rf.currentTerm, args.Term)
+		return
 	}
-	if rf.votedFor != -1 {
-		// 已经投票给别人了
+
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId{
 		reply.VoteGranted = false
-	}
-	if reply.VoteGranted {
-		rf.votedFor = args.CandidateId
-		rf.changeState(FOLLOWER)
-		rf.logger.Printf("Id(%d)想让我给他投票，我给了", args.CandidateId)
-	} else {
 		rf.logger.Printf("Id(%d)想让我给他投票，我不给，我给了Id(%d)", args.CandidateId, rf.votedFor)
+		return
 	}
+
+	rf.votedFor = args.CandidateId
+	// 在别人拉票的时候，把最新的Term记录下来
+	rf.currentTerm = args.Term
+	rf.changeState(FOLLOWER)
+	rf.logger.Printf("Id(%d)想让我给他投票，我给了", args.CandidateId)
 }
 
 type AppendEntriesArgs struct {
@@ -228,7 +233,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	
 	rf.logger.Printf("领导Id(%d)发来命令, Term: %v", args.LeaderId, args.Term)
-	rf.heartbeatTime = time.Now()
 	reply.Success = true
 	
 	if args.Term < rf.currentTerm {
@@ -237,6 +241,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logger.Printf("拒绝这个领导的命令(Term:%d)，跟不上我的脚步(currentTerm:%d)", args.Term, rf.currentTerm)
 		return
 	}
+	// 只有接收请求才更新心跳，避免一直拒绝但却不竞选新的
+	rf.heartbeatTime = time.Now()
 	rf.currentTerm = args.Term
 	rf.changeState(FOLLOWER)
 	rf.leaderId = args.LeaderId
@@ -252,25 +258,26 @@ func (rf *Raft) callRpc(method string, server int, args interface{}, reply inter
 	wg.Add(1)
 	var isOk int32 = 0
 	go func(){
-		var isTimeout int32 = 0
 		var isFinish int32 = 0
 		go func(){
-			time.Sleep(time.Microsecond * time.Duration(500))
+			rf.sleep(0.5)
 			if atomic.LoadInt32(&isFinish) == 1 {
 				return
 			}
-			atomic.StoreInt32(&isTimeout, 1)
-			wg.Done()
+			if atomic.CompareAndSwapInt32(&isFinish, 0, 1) {
+				wg.Done()
+			}
 		}()
 		ok := rf.peers[server].Call(method, args, reply)
-		if atomic.LoadInt32(&isTimeout) == 1 {
+		if atomic.LoadInt32(&isFinish) == 1 {
 			return
 		}
-		if ok {
-			atomic.StoreInt32(&isOk, 1)
+		if atomic.CompareAndSwapInt32(&isFinish, 0, 1) {
+			if ok {
+				atomic.StoreInt32(&isOk, 1)
+			}
+			wg.Done()
 		}
-		atomic.StoreInt32(&isFinish, 1)
-		wg.Done()
 	}()
 	wg.Wait()
 	return atomic.LoadInt32(&isOk) == 1
@@ -349,7 +356,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.logger.Print("我被杀了")
 }
 
 func (rf *Raft) killed() bool {
@@ -365,14 +371,14 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		time.Sleep(time.Duration(500) * time.Millisecond)
+		rf.sleep(1)
 		if rf.killed() {
 			log.Print("我死了")
 			return
 		}
 
-		rf.logger.Println("tick!")
 		rf.mu.Lock()
+		rf.logger.Println("tick!")
 		if rf.votedFor != -1 {
 			rf.logger.Print("正在进行选举，选举超时了")
 			
@@ -434,13 +440,15 @@ func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
 	rf.currentTerm += 1
+	electionTerm := rf.currentTerm
 	rf.changeState(CANDIDATE)
+	var votes int64 = 1 // 直接投一票给自己
+	rf.votedFor = rf.me
 	rf.mu.Unlock()
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers)-1)
-	var votes int64 = 1 // 直接投一票给自己
-	rf.votedFor = rf.me
+	
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -449,22 +457,24 @@ func (rf *Raft) startElection() {
 			reply := RequestVoteReply{}
 			isOk := rf.sendRequestVote(i, 
 				&RequestVoteArgs{
-					rf.currentTerm,
+					electionTerm,
 					rf.me,
 					0,
 					0,
 				}, &reply)
 			if !isOk {
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.logger.Printf("我落伍了，更新Term:%d", reply.Term)
-				} else {
-					rf.logger.Printf("请求投票失败，Id(%d)", i)
-				}
+				rf.logger.Printf("请求投票超时，Id(%d)", i)
 			} else if reply.VoteGranted {
 				rf.logger.Printf("拉票成功！Id(%d)", i)
 				atomic.AddInt64(&votes, 1)
+			} else if reply.Term > electionTerm {
+					rf.changeState(FOLLOWER)
+					rf.votedFor = -1
+					rf.logger.Printf("我落伍了，放弃竞选Id(%d)", i)
+			} else {
+				rf.logger.Printf("他票给别人了Id(%d)", i)
 			}
+			
 			wg.Done()
 		}(i)
 	}
@@ -486,8 +496,10 @@ func (rf *Raft) startElection() {
 		rf.logger.Println("我当选了")
 		rf.changeState(LEADER)
 		rf.sendHeartBeat()
+	} else {
+		// 没人当选才重新随机选举时间，毕竟如果有人当选，就尽量保持当前状态
+		rf.randomizeElectionTimeout()
 	}
-	rf.randomizeElectionTimeout()
 }
 
 func (rf *Raft) changeState(s int32) {
@@ -502,12 +514,13 @@ func (rf *Raft) changeState(s int32) {
 	rf.logger.Print("我不一样了")
 }
 
-func (rf *Raft) sleep() {
-	time.Sleep(time.Millisecond * time.Duration(atomic.LoadInt32(&rf.electionTimeout)))
+func (rf *Raft) sleep(factor float32) {
+	t := atomic.LoadInt32(&rf.electionTimeout) - rand.Int31n(300)
+	time.Sleep(time.Millisecond * time.Duration(factor * float32(t)))
 }
 
 func (rf *Raft) randomizeElectionTimeout() {
-	atomic.StoreInt32(&rf.electionTimeout, int32(1500 + rand.Int() % 500))
+	atomic.StoreInt32(&rf.electionTimeout, int32(100 + rand.Int() % 300))
 }
 
 //
