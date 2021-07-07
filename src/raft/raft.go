@@ -60,6 +60,11 @@ const (
 	LEADER = 2
 )
 
+type LogEntry struct {
+	Term int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -71,10 +76,12 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	applyCh chan ApplyMsg
+
 	state int32
 	currentTerm int
 	votedFor int
-	log []string
+	log []*LogEntry
 
 	commitIndex int
 	lastApplied int
@@ -218,7 +225,7 @@ type AppendEntriesArgs struct {
 	LeaderId int
 	PrevLogIndex int
 	PrevLogTerm int
-	Entries []string
+	Entries []*LogEntry
 	LeaderCommit int
 }
 
@@ -232,7 +239,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	
-	rf.logger.Printf("领导Id(%d)发来命令, Term: %v", args.LeaderId, args.Term)
+	rf.logger.Printf("领导Id(%d)发来命令, Args: %+v", args.LeaderId, args)
 	reply.Success = true
 	
 	if args.Term < rf.currentTerm {
@@ -241,12 +248,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logger.Printf("拒绝这个领导的命令(Term:%d)，跟不上我的脚步(currentTerm:%d)", args.Term, rf.currentTerm)
 		return
 	}
+
+	// 验证entries
+	if args.PrevLogIndex > len(rf.log) {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		rf.logger.Printf("拒绝添加Entries指令, PrevLogIndex:%d > len(rf.log):%d", args.PrevLogIndex, len(rf.log))
+		return
+	}
+
+  if args.PrevLogIndex != 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		rf.logger.Printf("拒绝添加Entries指令, rf.log[args.PrevLogIndex].term:%d != args.PrevLogTerm:%d", rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		return
+	}
+
 	// 只有接收请求才更新心跳，避免一直拒绝但却不竞选新的
 	rf.heartbeatTime = time.Now()
 	rf.currentTerm = args.Term
 	rf.changeState(FOLLOWER)
 	rf.leaderId = args.LeaderId
 	rf.votedFor = -1
+	
+	if args.PrevLogIndex == 0 {
+		rf.log = args.Entries
+	} else if len(args.Entries) == 0 {
+		// 心跳
+
+	} else {
+		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+	}
+	
+	if rf.commitIndex < args.LeaderCommit {
+		rf.commitIndex = args.LeaderCommit
+		if rf.commitIndex > len(rf.log) {
+			rf.commitIndex = len(rf.log)
+		}
+	}
+
+	rf.logger.Printf("当前状态: logs:%s, commitIndex:%v, leaderId:%v", logs2Str(rf.log), rf.commitIndex, rf.leaderId)
+
+	for i:=0; i < rf.commitIndex; i++ {
+		rf.applyCh <- ApplyMsg{true, rf.log[i].Command, i+1, false, nil, -1, -1}
+	}
+}
+
+func logs2Str(slice []*LogEntry) string {
+	result := "["
+	for _,v := range slice {
+		result += fmt.Sprintf("%+v,", v)
+	}
+	return result + "]"
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -260,7 +313,7 @@ func (rf *Raft) callRpc(method string, server int, args interface{}, reply inter
 	go func(){
 		var isFinish int32 = 0
 		go func(){
-			rf.sleep(0.5)
+			rf.sleep(0.95)
 			if atomic.LoadInt32(&isFinish) == 1 {
 				return
 			}
@@ -332,12 +385,29 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index := len(rf.log) + 1
+	term := rf.currentTerm
+	isLeader := atomic.LoadInt32(&rf.state) == LEADER
 
 	// Your code here (2B).
+	if !isLeader {
+		return index, term, isLeader
+	}
 
+	rf.logger.Println("Start Agreement!!!")
+
+	rf.log = append(rf.log, &LogEntry{term, command})
+	rf.commitIndex += 1
+
+	rf.applyCh <- ApplyMsg{true, command, index, false, nil, -1, -1}
+
+	if !rf.sendAppendEntriesToAll(rf.log[index-1:]) {
+		rf.logger.Println("Agreement没有被大部分人接受")
+	}
 
 	return index, term, isLeader
 }
@@ -410,6 +480,11 @@ func (rf *Raft) ticker() {
 // 返回是否全部失败
 func (rf *Raft) sendHeartBeat() bool {
 	// rf.logger.Print("发送心跳")
+	preLogIndex := len(rf.log)
+	prevLogTerm := 0
+	if preLogIndex > 0 {
+		prevLogTerm = rf.log[preLogIndex-1].Term
+	}
 	var hasOneSuccess int32 = 0
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers) - 1)
@@ -419,7 +494,7 @@ func (rf *Raft) sendHeartBeat() bool {
 		}
 		go func(i int)  {
 			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me, 0, 0, nil, 0}, reply)
+			ok := rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, prevLogTerm, []*LogEntry{}, rf.commitIndex}, reply)
 			if !ok {
 				rf.logger.Printf("发送心跳失败！Id(%d)", i)
 			} else {
@@ -434,6 +509,42 @@ func (rf *Raft) sendHeartBeat() bool {
 	}
 	wg.Wait()
 	return atomic.LoadInt32(&hasOneSuccess) == 0
+}
+
+// 返回是否大部分失败（2 * count >= total）
+func (rf *Raft) sendAppendEntriesToAll(entries []*LogEntry) bool {
+	preLogIndex := len(rf.log) - 1
+	prevLogTerm := 0
+	if preLogIndex > 0 {
+		prevLogTerm = rf.log[preLogIndex-1].Term
+	}
+
+	appendEntriesArgs := &AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, prevLogTerm, entries, rf.commitIndex}
+
+	var successCount int32 = 1 // 先把自己算上
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers) - 1)
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int)  {
+			reply := &AppendEntriesReply{}
+			ok := rf.sendAppendEntries(i, appendEntriesArgs, reply)
+			if !ok {
+				rf.logger.Printf("发送指令失败！Id(%d)", i)
+			} else {
+				if !reply.Success {
+					rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令", i)
+				} else {
+					atomic.AddInt32(&successCount, 1)
+				}
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	return int(atomic.LoadInt32(&successCount)) * 2 >= len(rf.peers)
 }
 
 func (rf *Raft) startElection() {
@@ -520,7 +631,7 @@ func (rf *Raft) sleep(factor float32) {
 }
 
 func (rf *Raft) randomizeElectionTimeout() {
-	atomic.StoreInt32(&rf.electionTimeout, int32(100 + rand.Int() % 300))
+	atomic.StoreInt32(&rf.electionTimeout, int32(500 + rand.Int() % 300))
 }
 
 //
@@ -546,6 +657,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.changeState(FOLLOWER)
 	rf.votedFor = -1
 	rf.randomizeElectionTimeout()
+	rf.commitIndex = 0
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
