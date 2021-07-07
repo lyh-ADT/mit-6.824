@@ -203,9 +203,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	rf.heartbeatTime = time.Now()
 	
-	if args.Term < rf.currentTerm {
+	// 竞选者的Term是+1过的，肯定要原来至少和我同一个Term才有资格当我的leader
+	if args.Term <= rf.currentTerm {
 		reply.VoteGranted = false
-		rf.logger.Printf("Id(%d)想让我给他投票，我不给, CurrentTerm:%d, CandidateTerm:%d", args.CandidateId, rf.currentTerm, args.Term)
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, CurrentTerm:%d, CandidateTerm:(%d-1)", args.CandidateId, rf.currentTerm, args.Term)
 		return
 	}
 
@@ -241,7 +242,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	
-	rf.logger.Printf("领导Id(%d)发来命令, Args: %+v", args.LeaderId, args)
+	rf.logger.Printf("领导Id(%d)发来命令, Args: entries:%+v, preLogIndex: %v, leaderCommit: %v", args.LeaderId, logs2Str(args.Entries), args.PrevLogIndex, args.LeaderCommit)
 	reply.Success = true
 	
 	if args.Term < rf.currentTerm {
@@ -250,6 +251,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logger.Printf("拒绝这个领导的命令(Term:%d)，跟不上我的脚步(currentTerm:%d)", args.Term, rf.currentTerm)
 		return
 	}
+
+	rf.currentTerm = args.Term
 
 	// 验证entries
 	if args.PrevLogIndex > len(rf.log) {
@@ -262,7 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   if args.PrevLogIndex != 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配, rf.log[args.PrevLogIndex].term:%d != args.PrevLogTerm", rf.log[args.PrevLogIndex].Term)
+		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配, rf.log[args.PrevLogIndex-1].term:%d != args.PrevLogTerm", rf.log[args.PrevLogIndex-1].Term)
 		return
 	}
 
@@ -282,7 +285,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
 	}
 	
-	if rf.commitIndex < args.LeaderCommit {
+	if rf.commitIndex != args.LeaderCommit {
 		rf.commitIndex = args.LeaderCommit
 		if rf.commitIndex > len(rf.log) {
 			rf.commitIndex = len(rf.log)
@@ -291,17 +294,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.logger.Printf("当前状态: logs:%s, commitIndex:%v, leaderId:%v", logs2Str(rf.log), rf.commitIndex, rf.leaderId)
 
-	for i:=0; i < rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{true, rf.log[i].Command, i+1, false, nil, -1, -1}
+	rf.applyCommited(rf.log[:rf.commitIndex])
+}
+
+func (rf *Raft) applyCommited(commitedLogs []*LogEntry) {
+	for i:=0; i < len(commitedLogs); i++ {
+		rf.applyCh <- ApplyMsg{true, commitedLogs[i].Command, i+1, false, nil, -1, -1}
 	}
 }
 
 func logs2Str(slice []*LogEntry) string {
 	result := "["
-	for _,v := range slice {
-		result += fmt.Sprintf("%+v,", v)
+	if len(slice) <= 3 {
+		for _,v := range slice {
+			result += fmt.Sprintf("%+v,", v)
+		}
+	} else {
+		result += "..."
+		for i:=len(slice) - 2; i < len(slice); i++ {
+			result += fmt.Sprintf("%+v,", slice[i])
+		}
 	}
-	return result + "]"
+	return result + fmt.Sprintf("(%d items)]", len(slice))
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -401,16 +415,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.logger.Println("Start Agreement!!!")
-
 	rf.log = append(rf.log, &LogEntry{term, command})
-	
-	if rf.sendAppendEntriesToAll(rf.log[index-1:]) {
-		rf.commitIndex += 1
-		rf.applyCh <- ApplyMsg{true, command, index, false, nil, -1, -1}
-	} else {
-		rf.logger.Println("Agreement没有被大部分人接受")
-	}
 
+	rf.sendAppendEntriesToAll()
 	return index, term, isLeader
 }
 
@@ -460,7 +467,7 @@ func (rf *Raft) ticker() {
 
 		if rf.state == LEADER {
 			// 我是领导者，发送心跳
-			if rf.sendHeartBeat() {
+			if rf.sendAppendEntriesToAll() <= 0{
 				rf.logger.Print("所有心跳发送失败，我断网了")
 				rf.changeState(FOLLOWER)
 			}
@@ -479,44 +486,10 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// 返回是否全部失败
-func (rf *Raft) sendHeartBeat() bool {
-	// rf.logger.Print("发送心跳")
-	preLogIndex := len(rf.log)
-	prevLogTerm := 0
-	if preLogIndex > 0 {
-		prevLogTerm = rf.log[preLogIndex-1].Term
-	}
-	var hasOneSuccess int32 = 0
-	wg := sync.WaitGroup{}
-	wg.Add(len(rf.peers) - 1)
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go func(i int)  {
-			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, prevLogTerm, []*LogEntry{}, rf.commitIndex}, reply)
-			if !ok {
-				rf.logger.Printf("发送心跳失败！Id(%d)", i)
-			} else {
-				if !reply.Success {
-					rf.logger.Printf("Id(%d)竟然拒绝了我的心跳", i)
-				} else {
-					atomic.StoreInt32(&hasOneSuccess, 1)
-				}
-			}
-			wg.Done()
-		}(i)
-	}
-	wg.Wait()
-	return atomic.LoadInt32(&hasOneSuccess) == 0
-}
 
-// 返回是否大部分失败（2 * count >= total）
-func (rf *Raft) sendAppendEntriesToAll(entries []*LogEntry) bool {
+// 返回成功的数量 是否大部分失败（2 * count >= total）
+func (rf *Raft) sendAppendEntriesToAll() int {
 	
-
 	var successCount int32 = 1 // 先把自己算上
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers) - 1)
@@ -527,20 +500,34 @@ func (rf *Raft) sendAppendEntriesToAll(entries []*LogEntry) bool {
 		go rf.doSendAppendEntries(i, &wg, &successCount)
 	}
 	wg.Wait()
-	return int(atomic.LoadInt32(&successCount)) * 2 >= len(rf.peers)
+
+	if int(successCount) * 2 >= len(rf.peers) {
+		if rf.commitIndex < len(rf.log) {
+			rf.logger.Println("大部分人接受了Agreement，进行提交")
+			rf.commitIndex = len(rf.log)
+			go rf.applyCommited(rf.log[:rf.commitIndex])
+			rf.sendAppendEntriesToAll()
+		}
+	} else {
+		rf.logger.Println("Agreement没有被大部分人接受")
+	}
+	return int(atomic.LoadInt32(&successCount))
 }
 
 func(rf *Raft) doSendAppendEntries(server int, wg *sync.WaitGroup, successCount *int32) {
+	defer wg.Done()
+
 	preLogIndex := rf.nextIndexes[server] - 1
-	if preLogIndex < 0 {
-		preLogIndex = 0
-	}
+	
 	prevLogTerm := 0
 	if preLogIndex > 0 {
 		prevLogTerm = rf.log[preLogIndex-1].Term
 	}
 
-	entries := rf.log[preLogIndex:]
+	var entries  []*LogEntry
+	if preLogIndex < len(rf.log) {
+		entries = rf.log[preLogIndex:]
+	}
 
 	appendEntriesArgs := &AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, prevLogTerm, entries, rf.commitIndex}
 	
@@ -548,15 +535,19 @@ func(rf *Raft) doSendAppendEntries(server int, wg *sync.WaitGroup, successCount 
 	ok := rf.sendAppendEntries(server, appendEntriesArgs, reply)
 	if !ok {
 		rf.logger.Printf("发送指令失败！Id(%d)", server)
-		wg.Done()
 	} else {
 		if !reply.Success {
-			rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令, 降低他的nextIndex后重试", server)
-			rf.nextIndexes[server] -= 1
-			rf.doSendAppendEntries(server, wg, successCount)
+			if reply.Term > rf.currentTerm {
+				rf.logger.Printf("Id(%d)的Term:%d比我的%d新，我直接退位", server, reply.Term, rf.currentTerm)
+				rf.changeState(FOLLOWER)
+			} else {
+				rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令, 降低他的nextIndex后重试", server)
+				rf.nextIndexes[server] -= 1
+				// rf.doSendAppendEntries(server, wg, successCount)
+			}
 		} else {
 			atomic.AddInt32(successCount, 1)
-			wg.Done()
+			rf.nextIndexes[server] += len(entries)
 		}
 	}
 }
@@ -620,11 +611,11 @@ func (rf *Raft) startElection() {
 	if votes * 2 > int64(len(rf.peers)) {
 		rf.logger.Println("我当选了")
 		rf.changeState(LEADER)
-		rf.sendHeartBeat()
+		rf.sendAppendEntriesToAll()
 
 		// 初始化nextIndexes
 		rf.nextIndexes = make([]int, len(rf.peers))
-		for i,_ := range rf.nextIndexes {
+		for i := range rf.nextIndexes {
 			rf.nextIndexes[i] = len(rf.log) + 1
 		}
 	} else {
@@ -656,6 +647,8 @@ func (rf *Raft) randomizeElectionTimeout() {
 	atomic.StoreInt32(&rf.electionTimeout, int32(500 + rand.Int() % 300))
 }
 
+const enableLog = true
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -676,11 +669,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.logger = log.New(os.Stdout, fmt.Sprintf("%d: ", me), log.Lshortfile|log.Ldate|log.Ltime)
+	if !enableLog {
+		rf.logger.SetOutput(&BlackHoleWriter{})
+	}
 	rf.changeState(FOLLOWER)
 	rf.votedFor = -1
 	rf.randomizeElectionTimeout()
 	rf.commitIndex = 0
 	rf.applyCh = applyCh
+	rf.nextIndexes = make([]int, len(rf.peers))
+	for i := range rf.nextIndexes {
+		rf.nextIndexes[i] = 1
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -690,4 +690,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	return rf
+}
+
+type BlackHoleWriter struct {}
+func (w *BlackHoleWriter) Write(b []byte) (n int, err error) {
+	return len(b), nil
 }
