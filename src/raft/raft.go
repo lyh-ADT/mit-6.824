@@ -403,11 +403,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logger.Println("Start Agreement!!!")
 
 	rf.log = append(rf.log, &LogEntry{term, command})
-	rf.commitIndex += 1
-
-	rf.applyCh <- ApplyMsg{true, command, index, false, nil, -1, -1}
-
-	if !rf.sendAppendEntriesToAll(rf.log[index-1:]) {
+	
+	if rf.sendAppendEntriesToAll(rf.log[index-1:]) {
+		rf.commitIndex += 1
+		rf.applyCh <- ApplyMsg{true, command, index, false, nil, -1, -1}
+	} else {
 		rf.logger.Println("Agreement没有被大部分人接受")
 	}
 
