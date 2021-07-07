@@ -90,6 +90,8 @@ type Raft struct {
 	electionTimeout int32 // seconds
 	heartbeatTime time.Time
 
+	nextIndexes []int
+
 	logger *log.Logger
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -253,14 +255,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > len(rf.log) {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("拒绝添加Entries指令, PrevLogIndex:%d > len(rf.log):%d", args.PrevLogIndex, len(rf.log))
+		rf.logger.Printf("拒绝添加Entries指令, 日志不连续, PrevLogIndex:%d > len(rf.log):%d", args.PrevLogIndex, len(rf.log))
 		return
 	}
 
   if args.PrevLogIndex != 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		rf.logger.Printf("拒绝添加Entries指令, rf.log[args.PrevLogIndex].term:%d != args.PrevLogTerm:%d", rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配, rf.log[args.PrevLogIndex].term:%d != args.PrevLogTerm", rf.log[args.PrevLogIndex].Term)
 		return
 	}
 
@@ -513,13 +515,7 @@ func (rf *Raft) sendHeartBeat() bool {
 
 // 返回是否大部分失败（2 * count >= total）
 func (rf *Raft) sendAppendEntriesToAll(entries []*LogEntry) bool {
-	preLogIndex := len(rf.log) - 1
-	prevLogTerm := 0
-	if preLogIndex > 0 {
-		prevLogTerm = rf.log[preLogIndex-1].Term
-	}
-
-	appendEntriesArgs := &AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, prevLogTerm, entries, rf.commitIndex}
+	
 
 	var successCount int32 = 1 // 先把自己算上
 	wg := sync.WaitGroup{}
@@ -528,23 +524,41 @@ func (rf *Raft) sendAppendEntriesToAll(entries []*LogEntry) bool {
 		if i == rf.me {
 			continue
 		}
-		go func(i int)  {
-			reply := &AppendEntriesReply{}
-			ok := rf.sendAppendEntries(i, appendEntriesArgs, reply)
-			if !ok {
-				rf.logger.Printf("发送指令失败！Id(%d)", i)
-			} else {
-				if !reply.Success {
-					rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令", i)
-				} else {
-					atomic.AddInt32(&successCount, 1)
-				}
-			}
-			wg.Done()
-		}(i)
+		go rf.doSendAppendEntries(i, &wg, &successCount)
 	}
 	wg.Wait()
 	return int(atomic.LoadInt32(&successCount)) * 2 >= len(rf.peers)
+}
+
+func(rf *Raft) doSendAppendEntries(server int, wg *sync.WaitGroup, successCount *int32) {
+	preLogIndex := rf.nextIndexes[server] - 1
+	if preLogIndex < 0 {
+		preLogIndex = 0
+	}
+	prevLogTerm := 0
+	if preLogIndex > 0 {
+		prevLogTerm = rf.log[preLogIndex-1].Term
+	}
+
+	entries := rf.log[preLogIndex:]
+
+	appendEntriesArgs := &AppendEntriesArgs{rf.currentTerm, rf.me, preLogIndex, prevLogTerm, entries, rf.commitIndex}
+	
+	reply := &AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, appendEntriesArgs, reply)
+	if !ok {
+		rf.logger.Printf("发送指令失败！Id(%d)", server)
+		wg.Done()
+	} else {
+		if !reply.Success {
+			rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令, 降低他的nextIndex后重试", server)
+			rf.nextIndexes[server] -= 1
+			rf.doSendAppendEntries(server, wg, successCount)
+		} else {
+			atomic.AddInt32(successCount, 1)
+			wg.Done()
+		}
+	}
 }
 
 func (rf *Raft) startElection() {
@@ -607,9 +621,17 @@ func (rf *Raft) startElection() {
 		rf.logger.Println("我当选了")
 		rf.changeState(LEADER)
 		rf.sendHeartBeat()
+
+		// 初始化nextIndexes
+		rf.nextIndexes = make([]int, len(rf.peers))
+		for i,_ := range rf.nextIndexes {
+			rf.nextIndexes[i] = len(rf.log) + 1
+		}
 	} else {
 		// 没人当选才重新随机选举时间，毕竟如果有人当选，就尽量保持当前状态
 		rf.randomizeElectionTimeout()
+		// 还原Term，否则断网重连后他就变成Term最大的了
+		rf.currentTerm = electionTerm - 1
 	}
 }
 
