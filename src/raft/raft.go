@@ -18,7 +18,7 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -27,7 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -84,10 +84,10 @@ type Raft struct {
 	Log []*LogEntry
 
 	commitIndex int
-	lastApplied int
+	lastApplied int32
 	leaderId int
 	
-	electionTimeout int32 // seconds
+	electionTimeout int32 // milliseconds
 	heartbeatTime time.Time
 
 	nextIndexes []int
@@ -114,13 +114,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -132,18 +132,26 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var CurrentTerm int
+	var VotedFor int
+	var Log []*LogEntry
+	if d.Decode(&CurrentTerm) != nil ||
+	   d.Decode(&VotedFor) != nil ||
+	   d.Decode(&Log) != nil  {
+	  rf.logger.Fatal("读取持久化状态失败")
+		return
+	}
+
+	rf.logger.Printf("读取持久化 currentTerm: %v, votedFor: %v, logs:%s", CurrentTerm, VotedFor, logs2Str(Log))
+	rf.CurrentTerm = CurrentTerm
+	rf.VotedFor = VotedFor
+	rf.Log = Log
+	
 }
 
 
@@ -228,6 +236,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.CurrentTerm = args.Term
 	rf.changeState(FOLLOWER)
 	rf.logger.Printf("Id(%d)想让我给他投票，我给了", args.CandidateId)
+
+	rf.persist()
 }
 
 type AppendEntriesArgs struct {
@@ -302,14 +312,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.logger.Printf("当前状态: logs:%s, commitIndex:%v, leaderId:%v", logs2Str(rf.Log), rf.commitIndex, rf.leaderId)
 
-	rf.applyCommited(rf.Log[:rf.commitIndex])
+	rf.applyCommited(rf.Log[:rf.commitIndex], rf.commitIndex)
+	
+	rf.persist()
 }
 
-func (rf *Raft) applyCommited(commitedLogs []*LogEntry) {
+func (rf *Raft) applyCommited(commitedLogs []*LogEntry, commitIndex int) {
 	for i:=0; i < len(commitedLogs); i++ {
 		rf.applyCh <- ApplyMsg{true, commitedLogs[i].Command, i+1, false, nil, -1, -1}
 	}
-	rf.lastApplied = rf.commitIndex
+	atomic.StoreInt32(&rf.lastApplied, int32(commitIndex))
 }
 
 func logs2Str(slice []*LogEntry) string {
@@ -521,7 +533,8 @@ func (rf *Raft) sendAppendEntriesToAll() int {
 		if rf.commitIndex < len(rf.Log) {
 			rf.logger.Println("大部分人接受了Agreement，进行提交")
 			rf.commitIndex = len(rf.Log)
-			go rf.applyCommited(rf.Log[:rf.commitIndex])
+			rf.persist()
+			go rf.applyCommited(rf.Log[:rf.commitIndex], rf.commitIndex)
 			rf.sendAppendEntriesToAll()
 		}
 	} else {
@@ -586,6 +599,8 @@ func (rf *Raft) startElection() {
 	if rf.commitIndex > 0 {
 		requestVoteArgs.LastLogTerm = rf.Log[rf.commitIndex-1].Term
 	}
+
+	rf.persist()
 	rf.mu.Unlock()
 
 	wg := sync.WaitGroup{}
@@ -644,6 +659,7 @@ func (rf *Raft) startElection() {
 		// 还原Term，否则断网重连后他就变成Term最大的了
 		rf.CurrentTerm = electionTerm - 1
 	}
+	rf.persist()
 }
 
 func (rf *Raft) changeState(s int32) {
