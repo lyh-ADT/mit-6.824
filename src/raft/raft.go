@@ -211,16 +211,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	
 	// 竞选者的Term是+1过的，肯定要原来至少和我同一个Term才有资格当我的leader
-	if args.Term <= rf.CurrentTerm {
+	if args.Term < rf.CurrentTerm {
 		reply.VoteGranted = false
-		rf.logger.Printf("Id(%d)想让我给他投票，我不给, CurrentTerm:%d, CandidateTerm:(%d-1)", args.CandidateId, rf.CurrentTerm, args.Term)
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, CurrentTerm:%d, CandidateTerm:%d", args.CandidateId, rf.CurrentTerm, args.Term)
 		return
 	}
 
-	if len(rf.Log) > 0 && (args.LastLogIndex < rf.commitIndex) {
+	if args.LastLogIndex < len(rf.Log) {
 		reply.VoteGranted = false
-		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他提交的日志没我多", args.CandidateId)
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他记录的日志没我多", args.CandidateId)
 		return		
+	}
+
+	if len(rf.Log) > 0 && args.LastLogTerm < rf.Log[len(rf.Log) - 1].Term {
+		reply.VoteGranted = false
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他的日志比我的旧", args.CandidateId)
+		return
 	}
 
 	if rf.VotedFor != -1 && rf.VotedFor != args.CandidateId{
@@ -593,11 +599,11 @@ func (rf *Raft) startElection() {
 	requestVoteArgs := &RequestVoteArgs{
 		electionTerm,
 		rf.me,
-		rf.commitIndex,
+		len(rf.Log),
 		0,
 	}
-	if rf.commitIndex > 0 {
-		requestVoteArgs.LastLogTerm = rf.Log[rf.commitIndex-1].Term
+	if requestVoteArgs.LastLogIndex > 0 {
+		requestVoteArgs.LastLogTerm = rf.Log[requestVoteArgs.LastLogIndex-1].Term
 	}
 
 	rf.persist()
