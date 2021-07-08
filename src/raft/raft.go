@@ -201,7 +201,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
-	rf.heartbeatTime = time.Now()
 	
 	// 竞选者的Term是+1过的，肯定要原来至少和我同一个Term才有资格当我的leader
 	if args.Term <= rf.currentTerm {
@@ -210,11 +209,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	if len(rf.log) > 0 && (args.LastLogIndex < rf.commitIndex) {
+		reply.VoteGranted = false
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他提交的日志没我多", args.CandidateId)
+		return		
+	}
+
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId{
 		reply.VoteGranted = false
 		rf.logger.Printf("Id(%d)想让我给他投票，我不给，我给了Id(%d)", args.CandidateId, rf.votedFor)
 		return
 	}
+	// 只有给他投票才更新心跳时间，否则别人一直请求投票，我没有机会
+	rf.heartbeatTime = time.Now()
 
 	rf.votedFor = args.CandidateId
 	// 在别人拉票的时候，把最新的Term记录下来
@@ -245,7 +252,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.logger.Printf("领导Id(%d)发来命令, Args: entries:%+v, preLogIndex: %v, leaderCommit: %v", args.LeaderId, logs2Str(args.Entries), args.PrevLogIndex, args.LeaderCommit)
 	reply.Success = true
 	
-	if args.Term < rf.currentTerm {
+	// (如果我正在竞选，那么我的currentTerm是加1过的 || 如果我投票给了一个竞选者，那么我的currentTerm会和那个竞选者的一样)，所以此时应该减一之后再判断
+	if args.Term < rf.currentTerm && !((rf.state == CANDIDATE || rf.votedFor != -1) && args.Term == rf.currentTerm - 1){
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		rf.logger.Printf("拒绝这个领导的命令(Term:%d)，跟不上我的脚步(currentTerm:%d)", args.Term, rf.currentTerm)
@@ -417,7 +425,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logger.Println("Start Agreement!!!")
 	rf.log = append(rf.log, &LogEntry{term, command})
 
-	rf.sendAppendEntriesToAll()
+	// go rf.sendAppendEntriesToAll() 直接等下一轮心跳，可以让多个Agreement合并一起发
 	return index, term, isLeader
 }
 
@@ -450,9 +458,14 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		rf.sleep(1)
+		// 让领导者少睡一会，减少竞选的概率
+		if atomic.LoadInt32(&rf.state) == LEADER {
+			rf.sleep(0.5)
+		} else {
+			rf.sleep(1)
+		}
 		if rf.killed() {
-			log.Print("我死了")
+			rf.logger.Print("我死了")
 			return
 		}
 
@@ -462,12 +475,14 @@ func (rf *Raft) ticker() {
 			rf.logger.Print("正在进行选举，选举超时了")
 			
 			rf.votedFor = -1
+			// 选举时会将currentTerm + 1
+			rf.currentTerm -= 1
 			rf.changeState(FOLLOWER)
 		}
 
 		if rf.state == LEADER {
 			// 我是领导者，发送心跳
-			if rf.sendAppendEntriesToAll() <= 0{
+			if rf.sendAppendEntriesToAll() <= 1{
 				rf.logger.Print("所有心跳发送失败，我断网了")
 				rf.changeState(FOLLOWER)
 			}
@@ -560,6 +575,16 @@ func (rf *Raft) startElection() {
 	rf.changeState(CANDIDATE)
 	var votes int64 = 1 // 直接投一票给自己
 	rf.votedFor = rf.me
+
+	requestVoteArgs := &RequestVoteArgs{
+		electionTerm,
+		rf.me,
+		rf.commitIndex,
+		0,
+	}
+	if rf.commitIndex > 0 {
+		requestVoteArgs.LastLogTerm = rf.log[rf.commitIndex-1].Term
+	}
 	rf.mu.Unlock()
 
 	wg := sync.WaitGroup{}
@@ -571,13 +596,7 @@ func (rf *Raft) startElection() {
 		}
 		go func(i int){
 			reply := RequestVoteReply{}
-			isOk := rf.sendRequestVote(i, 
-				&RequestVoteArgs{
-					electionTerm,
-					rf.me,
-					0,
-					0,
-				}, &reply)
+			isOk := rf.sendRequestVote(i,	requestVoteArgs, &reply)
 			if !isOk {
 				rf.logger.Printf("请求投票超时，Id(%d)", i)
 			} else if reply.VoteGranted {
@@ -644,7 +663,7 @@ func (rf *Raft) sleep(factor float32) {
 }
 
 func (rf *Raft) randomizeElectionTimeout() {
-	atomic.StoreInt32(&rf.electionTimeout, int32(500 + rand.Int() % 300))
+	atomic.StoreInt32(&rf.electionTimeout, int32(250 + rand.Int() % 300))
 }
 
 const enableLog = true
