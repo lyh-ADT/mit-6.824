@@ -80,13 +80,13 @@ type Raft struct {
 
 	state int32
 	CurrentTerm int
-	VotedFor int
+	VotedFor int32
 	Log []*LogEntry
 
 	commitIndex int
 	lastApplied int32
 	leaderId int
-	
+
 	electionTimeout int32 // milliseconds
 	heartbeatTime time.Time
 
@@ -149,9 +149,9 @@ func (rf *Raft) readPersist(data []byte) {
 
 	rf.logger.Printf("读取持久化 currentTerm: %v, votedFor: %v, logs:%s", CurrentTerm, VotedFor, logs2Str(Log))
 	rf.CurrentTerm = CurrentTerm
-	rf.VotedFor = VotedFor
+	rf.setVotedFor(VotedFor)
 	rf.Log = Log
-	
+
 }
 
 
@@ -206,10 +206,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	
+
 	reply.Term = rf.CurrentTerm
 	reply.VoteGranted = true
-	
+
 	// 竞选者的Term是+1过的，肯定要原来至少和我同一个Term才有资格当我的leader
 	if args.Term < rf.CurrentTerm {
 		reply.VoteGranted = false
@@ -220,7 +220,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogIndex < len(rf.Log) {
 		reply.VoteGranted = false
 		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他记录的日志没我多", args.CandidateId)
-		return		
+		return
 	}
 
 	if len(rf.Log) > 0 && args.LastLogTerm < rf.Log[len(rf.Log) - 1].Term {
@@ -229,7 +229,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.VotedFor != -1 && rf.VotedFor != args.CandidateId{
+	if rf.VotedFor != -1 && rf.getVotedFor() != args.CandidateId{
 		reply.VoteGranted = false
 		rf.logger.Printf("Id(%d)想让我给他投票，我不给，我给了Id(%d)", args.CandidateId, rf.VotedFor)
 		return
@@ -237,7 +237,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 只有给他投票才更新心跳时间，否则别人一直请求投票，我没有机会
 	rf.heartbeatTime = time.Now()
 
-	rf.VotedFor = args.CandidateId
+	rf.setVotedFor(args.CandidateId)
 	// 在别人拉票的时候，把最新的Term记录下来
 	rf.CurrentTerm = args.Term
 	rf.changeState(FOLLOWER)
@@ -258,16 +258,18 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	ConflictIndex int
+	ConflictTerm int
 }
 
 // RPCHandler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	
+
 	rf.logger.Printf("领导Id(%d)发来命令, Args: entries:%+v, preLogIndex: %v, leaderCommit: %v", args.LeaderId, logs2Str(args.Entries), args.PrevLogIndex, args.LeaderCommit)
 	reply.Success = true
-	
+
 	// (如果我正在竞选，那么我的currentTerm是加1过的 || 如果我投票给了一个竞选者，那么我的currentTerm会和那个竞选者的一样)，所以此时应该减一之后再判断
 	if args.Term < rf.CurrentTerm && !((rf.state == CANDIDATE || rf.VotedFor != -1) && args.Term == rf.CurrentTerm - 1){
 		reply.Success = false
@@ -282,14 +284,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > len(rf.Log) {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
+		reply.ConflictIndex = len(rf.Log)
+		if reply.ConflictIndex > 0 {
+			reply.ConflictTerm = rf.Log[reply.ConflictIndex - 1].Term
+		}
 		rf.logger.Printf("拒绝添加Entries指令, 日志不连续, PrevLogIndex:%d > len(rf.log):%d", args.PrevLogIndex, len(rf.Log))
 		return
 	}
 
-  if args.PrevLogIndex != 0 && rf.Log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+  if args.PrevLogIndex != 0 && rf.Log[args.PrevLogIndex-1].Term > args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
-		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配, rf.log[args.PrevLogIndex-1].term:%d != args.PrevLogTerm", rf.Log[args.PrevLogIndex-1].Term)
+		reply.ConflictIndex = args.PrevLogIndex
+		if reply.ConflictIndex > 0 {
+			reply.ConflictTerm = rf.Log[reply.ConflictIndex - 1].Term
+		}
+		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配，他的比我的旧, rf.log[args.PrevLogIndex-1].term:%d > args.PrevLogTerm:%d", rf.Log[args.PrevLogIndex-1].Term, args.PrevLogTerm)
 		return
 	}
 
@@ -298,8 +308,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.CurrentTerm = args.Term
 	rf.changeState(FOLLOWER)
 	rf.leaderId = args.LeaderId
-	rf.VotedFor = -1
-	
+	rf.setVotedFor(-1)
+
 	if args.PrevLogIndex == 0 {
 		rf.Log = args.Entries
 	} else if len(args.Entries) == 0 {
@@ -308,7 +318,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		rf.Log = append(rf.Log[:args.PrevLogIndex], args.Entries...)
 	}
-	
+
 	if rf.commitIndex != args.LeaderCommit {
 		rf.commitIndex = args.LeaderCommit
 		if rf.commitIndex > len(rf.Log) {
@@ -319,7 +329,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.logger.Printf("当前状态: logs:%s, commitIndex:%v, leaderId:%v", logs2Str(rf.Log), rf.commitIndex, rf.leaderId)
 
 	rf.applyCommited(rf.Log[:rf.commitIndex], rf.commitIndex)
-	
+
 	rf.persist()
 }
 
@@ -331,14 +341,15 @@ func (rf *Raft) applyCommited(commitedLogs []*LogEntry, commitIndex int) {
 }
 
 func logs2Str(slice []*LogEntry) string {
+	const threshold = 10
 	result := "["
-	if len(slice) <= 3 {
+	if len(slice) <= threshold {
 		for _,v := range slice {
 			result += fmt.Sprintf("%+v,", v)
 		}
 	} else {
 		result += "..."
-		for i:=len(slice) - 2; i < len(slice); i++ {
+		for i:=len(slice) - threshold + 1; i < len(slice); i++ {
 			result += fmt.Sprintf("%+v,", slice[i])
 		}
 	}
@@ -428,7 +439,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -473,7 +484,7 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		
+
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
@@ -490,10 +501,12 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		rf.logger.Println("tick!")
+		rf.logger.Printf("当前状态: logs:%s, commitIndex:%v, leaderId:%v", logs2Str(rf.Log), rf.commitIndex, rf.leaderId)
+
 		if rf.VotedFor != -1 {
 			rf.logger.Print("正在进行选举，选举超时了")
-			
-			rf.VotedFor = -1
+
+			rf.setVotedFor(-1)
 			// 选举时会将currentTerm + 1
 			rf.CurrentTerm -= 1
 			rf.changeState(FOLLOWER)
@@ -516,14 +529,14 @@ func (rf *Raft) ticker() {
 				rf.mu.Unlock()
 			}
 		}
-		
+
 	}
 }
 
 
 // 返回成功的数量 是否大部分失败（2 * count >= total）
 func (rf *Raft) sendAppendEntriesToAll() int {
-	
+
 	var successCount int32 = 1 // 先把自己算上
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers) - 1)
@@ -553,7 +566,7 @@ func(rf *Raft) doSendAppendEntries(server int, wg *sync.WaitGroup, successCount 
 	defer wg.Done()
 
 	preLogIndex := rf.nextIndexes[server] - 1
-	
+
 	prevLogTerm := 0
 	if preLogIndex > 0 {
 		prevLogTerm = rf.Log[preLogIndex-1].Term
@@ -565,7 +578,7 @@ func(rf *Raft) doSendAppendEntries(server int, wg *sync.WaitGroup, successCount 
 	}
 
 	appendEntriesArgs := &AppendEntriesArgs{rf.CurrentTerm, rf.me, preLogIndex, prevLogTerm, entries, rf.commitIndex}
-	
+
 	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, appendEntriesArgs, reply)
 	if !ok {
@@ -576,8 +589,16 @@ func(rf *Raft) doSendAppendEntries(server int, wg *sync.WaitGroup, successCount 
 				rf.logger.Printf("Id(%d)的Term:%d比我的%d新，我直接退位", server, reply.Term, rf.CurrentTerm)
 				rf.changeState(FOLLOWER)
 			} else {
-				rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令, 降低他的nextIndex后重试", server)
-				rf.nextIndexes[server] -= 1
+
+				rf.nextIndexes[server] = reply.ConflictIndex
+				if rf.nextIndexes[server] > len(rf.Log) {
+					rf.logger.Printf("Id(%d)的日志记录比我的多...", server)
+					rf.nextIndexes[server] = len(rf.Log)
+				}
+				for rf.nextIndexes[server] > 1 && rf.Log[rf.nextIndexes[server] - 1].Term < reply.ConflictTerm {
+					rf.nextIndexes[server] -= 1
+				}
+				rf.logger.Printf("Id(%d)竟然拒绝了我的添加指令, 降低他的nextIndex(%d)后重试", server, rf.nextIndexes[server])
 				// rf.doSendAppendEntries(server, wg, successCount)
 			}
 		} else {
@@ -594,7 +615,7 @@ func (rf *Raft) startElection() {
 	electionTerm := rf.CurrentTerm
 	rf.changeState(CANDIDATE)
 	var votes int64 = 1 // 直接投一票给自己
-	rf.VotedFor = rf.me
+	rf.setVotedFor(rf.me)
 
 	requestVoteArgs := &RequestVoteArgs{
 		electionTerm,
@@ -611,7 +632,7 @@ func (rf *Raft) startElection() {
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(rf.peers)-1)
-	
+
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -626,12 +647,12 @@ func (rf *Raft) startElection() {
 				atomic.AddInt64(&votes, 1)
 			} else if reply.Term > electionTerm {
 					rf.changeState(FOLLOWER)
-					rf.VotedFor = -1
+					rf.setVotedFor(-1)
 					rf.logger.Printf("我落伍了，放弃竞选Id(%d)", i)
 			} else {
 				rf.logger.Printf("他票给别人了Id(%d)", i)
 			}
-			
+
 			wg.Done()
 		}(i)
 	}
@@ -639,7 +660,7 @@ func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.VotedFor = -1
+	rf.setVotedFor(-1)
 
 	if rf.state == FOLLOWER {
 		rf.logger.Printf("有人先当选了 : ) Id:%d", rf.leaderId)
@@ -652,13 +673,13 @@ func (rf *Raft) startElection() {
 	if votes * 2 > int64(len(rf.peers)) {
 		rf.logger.Println("我当选了")
 		rf.changeState(LEADER)
-		rf.sendAppendEntriesToAll()
-
 		// 初始化nextIndexes
 		rf.nextIndexes = make([]int, len(rf.peers))
 		for i := range rf.nextIndexes {
 			rf.nextIndexes[i] = len(rf.Log) + 1
 		}
+
+		rf.sendAppendEntriesToAll()
 	} else {
 		// 没人当选才重新随机选举时间，毕竟如果有人当选，就尽量保持当前状态
 		rf.randomizeElectionTimeout()
@@ -681,12 +702,20 @@ func (rf *Raft) changeState(s int32) {
 }
 
 func (rf *Raft) sleep(factor float32) {
-	t := atomic.LoadInt32(&rf.electionTimeout) - rand.Int31n(300)
+	t := atomic.LoadInt32(&rf.electionTimeout) - rand.Int31n(100)
 	time.Sleep(time.Millisecond * time.Duration(factor * float32(t)))
 }
 
 func (rf *Raft) randomizeElectionTimeout() {
-	atomic.StoreInt32(&rf.electionTimeout, int32(250 + rand.Int() % 300))
+	atomic.StoreInt32(&rf.electionTimeout, int32(250 + rand.Int() % 100))
+}
+
+func (rf *Raft) setVotedFor(i int) {
+	atomic.StoreInt32(&rf.VotedFor, int32(i))
+}
+
+func (rf *Raft) getVotedFor() int {
+	return int(atomic.LoadInt32(&rf.VotedFor))
 }
 
 const enableLog = true
@@ -715,7 +744,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.logger.SetOutput(&BlackHoleWriter{})
 	}
 	rf.changeState(FOLLOWER)
-	rf.VotedFor = -1
+	rf.setVotedFor(-1)
 	rf.randomizeElectionTimeout()
 	rf.commitIndex = 0
 	rf.applyCh = applyCh
