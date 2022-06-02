@@ -296,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   if args.PrevLogIndex != 0 && rf.Log[args.PrevLogIndex-1].Term > args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
-		reply.ConflictIndex = args.PrevLogIndex
+		reply.ConflictIndex = rf.commitIndex
 		if reply.ConflictIndex > 0 {
 			reply.ConflictTerm = rf.Log[reply.ConflictIndex - 1].Term
 		}
@@ -307,7 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex != 0 && rf.Log[args.PrevLogIndex-1].Term < args.PrevLogTerm {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
-		reply.ConflictIndex = args.PrevLogIndex
+		reply.ConflictIndex = rf.commitIndex
 		if reply.ConflictIndex > 0 {
 			reply.ConflictTerm = rf.Log[reply.ConflictIndex - 1].Term
 		}
