@@ -217,7 +217,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if args.LastLogIndex < len(rf.Log) {
+	// 只有同term的log才有比较的资格
+	if len(rf.Log) > 0 && args.LastLogTerm <= rf.Log[len(rf.Log) - 1].Term && args.LastLogIndex < len(rf.Log) {
 		reply.VoteGranted = false
 		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他记录的日志没我多", args.CandidateId)
 		return
@@ -225,7 +226,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if len(rf.Log) > 0 && args.LastLogTerm < rf.Log[len(rf.Log) - 1].Term {
 		reply.VoteGranted = false
-		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他的日志比我的旧", args.CandidateId)
+		rf.logger.Printf("Id(%d)想让我给他投票，我不给, 他的日志比我的旧, 我的日志Term: %d, 他的日志Trem: %d", args.CandidateId, rf.Log[len(rf.Log) - 1].Term, args.LastLogTerm)
 		return
 	}
 
@@ -300,6 +301,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ConflictTerm = rf.Log[reply.ConflictIndex - 1].Term
 		}
 		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配，他的比我的旧, rf.log[args.PrevLogIndex-1].term:%d > args.PrevLogTerm:%d", rf.Log[args.PrevLogIndex-1].Term, args.PrevLogTerm)
+		return
+	}
+
+	if args.PrevLogIndex != 0 && rf.Log[args.PrevLogIndex-1].Term < args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.CurrentTerm
+		reply.ConflictIndex = args.PrevLogIndex
+		if reply.ConflictIndex > 0 {
+			reply.ConflictTerm = rf.Log[reply.ConflictIndex - 1].Term
+		}
+		rf.logger.Printf("拒绝添加Entries指令,  与我的记录中的Term不匹配，我的比他的旧, rf.log[args.PrevLogIndex-1].term:%d < args.PrevLogTerm:%d", rf.Log[args.PrevLogIndex-1].Term, args.PrevLogTerm)
 		return
 	}
 
@@ -645,7 +657,7 @@ func (rf *Raft) startElection() {
 			} else if reply.VoteGranted {
 				rf.logger.Printf("拉票成功！Id(%d)", i)
 				atomic.AddInt64(&votes, 1)
-			} else if reply.Term > electionTerm {
+			} else if reply.Term >= electionTerm {
 					rf.changeState(FOLLOWER)
 					rf.setVotedFor(-1)
 					rf.logger.Printf("我落伍了，放弃竞选Id(%d)", i)
